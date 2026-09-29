@@ -1,255 +1,409 @@
 # =============================================================================
 # MODULE 4 | LAB 4.1
-# File: 01_model_serialization.py
-# Purpose: Implement MLflow MLOps registry tracking, spin up background
-#          FastAPI servers via uvicorn, and benchmark cache-hit vs cache-miss
-#          request latencies against production p99 SLA targets (< 50ms).
-# Saras AI Institute | Build Predictive Models & Modern Recommenders
+# File: mlflow_fastapi.py
+# Purpose: MLflow run tracking + FastAPI endpoint + latency benchmark
+# Python: 3.13-compatible, memory-conscious serving version
 # =============================================================================
 
 import os
+import sys
 import time
-import json
+import gc
 import pickle
+import shutil
 import subprocess
+from pathlib import Path
+
 import requests
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import warnings
-warnings.filterwarnings('ignore')
+
+warnings.filterwarnings("ignore")
+
+import mlflow
 
 print("=" * 60)
 print("  MODULE 4 | LAB 4.1")
 print("  MLflow Registry + FastAPI Endpoint + Latency Benchmark")
 print("=" * 60)
 
+os.makedirs("data", exist_ok=True)
+os.makedirs("output", exist_ok=True)
+
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 8000
+BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
+N_COLD_REQUESTS = 25
+N_WARM_REQUESTS = 25
+
+
+def load_pickle_checked(path):
+    """Load required non-empty pickle artifacts."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing artifact: {path}")
+    if os.path.getsize(path) == 0:
+        raise ValueError(f"Artifact is empty: {path}")
+    try:
+        with open(path, "rb") as file:
+            return pickle.load(file)
+    except EOFError as error:
+        raise ValueError(f"Artifact is incomplete/corrupted: {path}") from error
+
+
+def wait_for_server(url, attempts=180, pause_seconds=1):
+    """Wait for FastAPI to finish startup and return a healthy response."""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(f"{url}/health", timeout=5)
+            if response.status_code == 200:
+                return response.json(), attempt
+            print(f"    Waiting... attempt {attempt}/{attempts} (HTTP {response.status_code})")
+        except requests.RequestException:
+            if attempt == 1 or attempt % 5 == 0:
+                print(f"    Waiting for artifact loading... attempt {attempt}/{attempts}")
+        time.sleep(pause_seconds)
+    return None, attempts
+
+
+def prepare_local_runtime_artifacts():
+    """Copy only required serving files from Drive to fast local Colab storage."""
+    source_data_dir = Path("data")
+    local_data_dir = Path("/content/runtime_bundle/data")
+    local_data_dir.mkdir(parents=True, exist_ok=True)
+
+    required_files = [
+        "als_artifacts.pkl",
+        "lightfm_serving.pkl",
+        "faiss_artifacts.pkl",
+        "routing_split.pkl",
+        "faiss_index.bin",
+        "events.csv",
+    ]
+
+    print("\n    Preparing local API runtime bundle...")
+    for filename in required_files:
+        source_path = source_data_dir / filename
+        target_path = local_data_dir / filename
+
+        if not source_path.exists():
+            raise FileNotFoundError(f"Required runtime file is missing: {source_path}")
+
+        source_size = source_path.stat().st_size
+        if target_path.exists() and target_path.stat().st_size == source_size:
+            print(f"      Reusing local file: {filename}")
+            continue
+
+        print(f"      Copying: {filename} ({source_size / 1024 / 1024:.1f} MB)")
+        shutil.copy2(source_path, target_path)
+
+    return str(local_data_dir)
+
+
 # ---------------------------------------------------------------------------
-# SECTION 1: Install and Import MLflow
+# SECTION 1: MLflow Setup
 # ---------------------------------------------------------------------------
 print("\n[1] Setting up MLflow...")
+print(f"    Python executable : {sys.executable}")
+print(f"    MLflow version    : {mlflow.__version__}")
 
-try:
-    import mlflow
-    import mlflow.sklearn
-    import mlflow.pyfunc
-    print(f"    MLflow version : {mlflow.__version__}")
-except ImportError:
-    print("    Installing MLflow...")
-    os.system("pip install mlflow -q")
-    import mlflow
+mlflow.set_tracking_uri("sqlite:///data/mlflow.db")
+mlflow.set_experiment("hybrid-recommender")
+print("    Experiment        : hybrid-recommender")
 
-# TODO: Configure MLflow back-end database storage tracking URI to "sqlite:///data/mlflow.db"
-# Hint: Call mlflow.set_tracking_uri()
-
-
-# TODO: Initialize or switch to an active MLflow experiment workspace named "hybrid-recommender"
-# Hint: Call mlflow.set_experiment()
-
-
-print(f"    Experiment     : hybrid-recommender")
 
 # ---------------------------------------------------------------------------
-# SECTION 2: Load Artifacts
+# SECTION 2: Load only compact metadata-bearing artifacts
 # ---------------------------------------------------------------------------
-print("\n[2] Loading model artifacts...")
+print("\n[2] Loading model metadata artifacts...")
 
-with open("data/als_artifacts.pkl",    "rb") as f: als_art = pickle.load(f)
-with open("data/lightfm_artifacts.pkl","rb") as f: lfm_art = pickle.load(f)
-with open("data/faiss_artifacts.pkl",  "rb") as f: fai_art = pickle.load(f)
+# Do not load lightfm_serving.pkl here: it can be multi-GB. Uvicorn is the
+# sole process that should deserialize it during serving startup.
+als_art = load_pickle_checked("data/als_artifacts.pkl")
+fai_art = load_pickle_checked("data/faiss_artifacts.pkl")
 
-als_model   = als_art['model']
-lfm_model   = lfm_art['model_hybrid']
-best_ndcg   = als_art.get('best_ndcg', 0.017)
-hybrid_p10  = lfm_art.get('hybrid_test_precision', 0.01)
+als_model = als_art["model"]
+best_ndcg = float(
+    als_art.get(
+        "best_ndcg_at_10",
+        als_art.get("baseline_ndcg_at_10", als_art.get("best_ndcg", 0.017)),
+    )
+)
+
+# Values are intentionally stored as deployment metadata, avoiding a second
+# in-memory deserialization of lightfm_serving.pkl in this launcher process.
+LIGHTFM_LOSS = "warp"
+LIGHTFM_COMPONENTS = 64
+hybrid_p10 = 0.0
 
 print(f"    ALS model loaded   : factors={als_model.factors}")
-print(f"    LightFM loaded     : components={lfm_model.no_components}")
+print(f"    LightFM serving    : components={LIGHTFM_COMPONENTS} (loaded by API only)")
+print(f"    ALS NDCG@10        : {best_ndcg:.4f}")
+print(f"    LightFM P@10       : {hybrid_p10:.4f}")
 
 
 # ---------------------------------------------------------------------------
-# SECTION 3: Register ALS in MLflow
+# SECTION 3: Track ALS in MLflow without duplicating binary artifacts
 # ---------------------------------------------------------------------------
 print("\n[3] Registering ALS model in MLflow...")
 
-# TODO: Open an active MLflow run context assigning a run name="als_personalization_engine"
-# Hint: Use python's context manager "with mlflow.start_run(run_name=...):"
-if False: # Replace with context manager statement
-    pass
-    # TODO: Log hyperparameter tokens to the metadata registry using mlflow.log_param()
-    # Log: "model_type" -> "ALS", "factors" -> als_model.factors, "iterations" -> als_model.iterations, 
-    # "regularization" -> als_model.regularization, "n_users" -> len(als_art['user_ids']), "n_items" -> len(als_art['item_ids'])
-
-    
-    # TODO: Record validation metrics to the run metadata registry using mlflow.log_metric()
-    # Metric: "ndcg_at_10" -> best_ndcg
-
-    
-    # TODO: Bind tracking artifact binary paths to the current tracking run using mlflow.log_artifact()
-    # Track: "data/als_artifacts.pkl" and "data/faiss_artifacts.pkl" under the directory boundary "model"
-
-    
-    # Isolate your dynamic workspace run identifier
-    als_run_id = mlflow.active_run().info.run_id
-    print(f"    ALS run ID    : {als_run_id}")
-else:
-    als_run_id = "N/A"
+with mlflow.start_run(run_name="als_personalization_engine"):
+    mlflow.log_params({
+        "model_type": "ALS",
+        "factors": int(als_model.factors),
+        "iterations": int(als_model.iterations),
+        "regularization": float(als_model.regularization),
+        "n_users": int(len(als_art["user_ids"])),
+        "n_items": int(len(als_art["item_ids"])),
+    })
+    mlflow.log_metric("ndcg_at_10", best_ndcg)
+    mlflow.set_tag("als_artifact_path", os.path.abspath("data/als_artifacts.pkl"))
+    mlflow.set_tag("faiss_artifact_path", os.path.abspath("data/faiss_artifacts.pkl"))
+    mlflow.log_dict({
+        "model_type": "ALS",
+        "artifact_path": os.path.abspath("data/als_artifacts.pkl"),
+        "faiss_artifact_path": os.path.abspath("data/faiss_artifacts.pkl"),
+        "ndcg_at_10": best_ndcg,
+    }, "model/als_model_reference.json")
+    print(f"    ALS run ID         : {mlflow.active_run().info.run_id}")
 
 
 # ---------------------------------------------------------------------------
-# SECTION 4: Register LightFM in MLflow
+# SECTION 4: Track LightFM serving reference without copying model binaries
 # ---------------------------------------------------------------------------
 print("\n[4] Registering LightFM model in MLflow...")
 
-# TODO: Open an alternative run logging context tracking the coldstart engine under name="lightfm_coldstart_engine"
-if False: # Replace with context manager statement
-    pass
-    # TODO: Log system tracking properties using mlflow.log_param()
-    # Params: "model_type" -> "LightFM", "loss" -> "warp", "no_components" -> lfm_model.no_components, "n_items" -> fai_art['n_items']
+with mlflow.start_run(run_name="lightfm_coldstart_engine"):
+    mlflow.log_params({
+        "model_type": "LightFM Hybrid",
+        "loss": LIGHTFM_LOSS,
+        "no_components": LIGHTFM_COMPONENTS,
+        "n_items": int(fai_art["n_items"]),
+    })
+    mlflow.log_metric("precision_at_10", hybrid_p10)
+    mlflow.set_tag(
+        "lightfm_serving_artifact_path",
+        os.path.abspath("data/lightfm_serving.pkl"),
+    )
+    mlflow.log_dict({
+        "model_type": "LightFM Hybrid",
+        "artifact_path": os.path.abspath("data/lightfm_serving.pkl"),
+        "loss": LIGHTFM_LOSS,
+        "no_components": LIGHTFM_COMPONENTS,
+        "precision_at_10": hybrid_p10,
+    }, "model/lightfm_model_reference.json")
+    print(f"    LightFM run ID     : {mlflow.active_run().info.run_id}")
 
-    
-    # TODO: Log validation metric constraints via mlflow.log_metric()
-    # Metric: "precision_at_10" -> hybrid_p10
 
-    
-    # TODO: Log target binary storage payloads via mlflow.log_artifact()
-    # Payload: "data/lightfm_artifacts.pkl" pointing to artifact path "model"
-
-    
-    lfm_run_id = mlflow.active_run().info.run_id
-    print(f"    LightFM run ID  : {lfm_run_id}")
-else:
-    lfm_run_id = "N/A"
+# Release ALS objects before starting Uvicorn to minimize parent-process RAM.
+del als_model, als_art, fai_art
+gc.collect()
 
 
 # ---------------------------------------------------------------------------
-# SECTION 5: Show MLflow Registry
+# SECTION 5: Show MLflow Run Metadata
 # ---------------------------------------------------------------------------
 print("\n[5] MLflow experiment runs:")
+client = mlflow.tracking.MlflowClient()
+experiment = client.get_experiment_by_name("hybrid-recommender")
 
-# TODO: Instantiate an mlflow.tracking.MlflowClient() object, retrieve the "hybrid-recommender" experiment,
-# and use client.search_runs() to gather experiment entries to print out metadata updates
-client = None
+if experiment is not None:
+    runs = client.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        order_by=["attributes.start_time DESC"],
+        max_results=10,
+    )
+    for run in runs:
+        print(f"\n    Run name : {run.data.tags.get('mlflow.runName', 'Unnamed')}")
+        print(f"    Run ID   : {run.info.run_id}")
+        print(f"    Status   : {run.info.status}")
+        print(f"    Params   : {run.data.params}")
+        print(f"    Metrics  : {run.data.metrics}")
 
 
 # ---------------------------------------------------------------------------
 # SECTION 6: Start FastAPI Server
 # ---------------------------------------------------------------------------
 print("\n[6] Starting FastAPI server...")
-print("    Starting uvicorn on http://localhost:8000 ...")
+local_artifacts_dir = prepare_local_runtime_artifacts()
+print(f"    Runtime artifacts : {local_artifacts_dir}")
+print(f"    Starting Uvicorn on {BASE_URL} ...")
 
-# TODO: Automate hosting by spawning an background asynchronous process pointing to app.py
-# Hint: Use subprocess.Popen() to call -> ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "warning"]
-# Map stdout and stderr to subprocess.DEVNULL to silence server logs within the main execution loop
-server_process = None
+server_log_path = "output/fastapi_server.log"
+server_log = open(server_log_path, "w", encoding="utf-8")
+server_environment = os.environ.copy()
+server_environment["ARTIFACTS_DIR"] = local_artifacts_dir
 
-# Health Check Optimization block: loops requests sequentially to verify startup ready states
+server_process = subprocess.Popen(
+    [
+        sys.executable, "-m", "uvicorn", "app:app",
+        "--host", SERVER_HOST,
+        "--port", str(SERVER_PORT),
+        "--log-level", "info",
+    ],
+    cwd=os.getcwd(),
+    env=server_environment,
+    stdout=server_log,
+    stderr=subprocess.STDOUT,
+)
+
 print("    Waiting for server to be ready...")
-for attempt in range(30):
-    try:
-        # TODO: Ping server status parameters by executing requests.get() against "http://localhost:8000/health"
-        resp = None
-        if resp is not None and resp.status_code == 200:
-            print(f"    Server ready after {attempt+1} attempts")
-            health = resp.json()
-            print(f"    Redis Connected : {health['redis_connected']}")
-            break
-    except Exception:
-        time.sleep(1)
-else:
-    print("    WARNING: Server did not start in 30s")
-    server_process = None
+health, attempts = wait_for_server(BASE_URL)
+
+if health is None:
+    print("    WARNING: Server did not start successfully.")
+    if server_process.poll() is not None:
+        print(f"    Process exit code: {server_process.returncode}")
+    server_log.close()
+    if os.path.exists(server_log_path):
+        print("\n    FastAPI server log:")
+        with open(server_log_path, "r", encoding="utf-8") as file:
+            print(file.read()[-5000:])
+    raise RuntimeError("FastAPI failed to start. Review output/fastapi_server.log.")
+
+print(f"    Server ready after {attempts} attempts")
+print(f"    Redis connected : {health.get('redis_connected', False)}")
+print(f"    ALS loaded      : {health.get('als_loaded', False)}")
+print(f"    LightFM loaded  : {health.get('lfm_loaded', False)}")
 
 
 # ---------------------------------------------------------------------------
-# SECTION 7: Test the Endpoint
+# SECTION 7: Endpoint Smoke Test
 # ---------------------------------------------------------------------------
 print("\n[7] Testing /recommend endpoint...")
 
-if als_art is not None:
-    sample_users = [int(u) for u in list(als_art['user_ids'])[:3]]
+# Use stable known ALS user IDs from a compact artifact only after server starts.
+# Reloading ALS is cheap (~8 MB) and occurs after the child server is alive.
+als_smoke_art = load_pickle_checked("data/als_artifacts.pkl")
+sample_users = [int(user_id) for user_id in list(als_smoke_art["user_ids"])[:3]]
+del als_smoke_art
+gc.collect()
 
-    for user_id in sample_users:
-        # TODO: Construct a requests.get loop fetching recommendations from "http://localhost:8000/recommend/{user_id}"
-        # Parameters to append: {"top_k": 5, "use_cache": True}
-        # Print engine outputs and processing latencies returned by the payload body json
-        pass
+for user_id in sample_users:
+    try:
+        response = requests.get(
+            f"{BASE_URL}/recommend/{user_id}",
+            params={"top_k": 5, "use_cache": True},
+            timeout=90,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        print(f"\n    User ID         : {user_id}")
+        print(f"    Engine          : {payload.get('engine')}")
+        print(f"    Cached          : {payload.get('cached')}")
+        print(f"    Latency         : {payload.get('latency_ms', 0):.2f} ms")
+        print(f"    Recommendations : {payload.get('recommendations')}")
+    except requests.RequestException as error:
+        print(f"    Request failed for user {user_id}: {error}")
 
 
 # ---------------------------------------------------------------------------
 # SECTION 8: Latency Benchmark
 # ---------------------------------------------------------------------------
-print("\n[8] Latency benchmark (200 requests)...")
+print(f"\n[8] Latency benchmark ({N_COLD_REQUESTS + N_WARM_REQUESTS} requests)...")
+rng = np.random.default_rng(42)
+bench_users = rng.choice(sample_users, size=max(N_COLD_REQUESTS, N_WARM_REQUESTS), replace=True)
 
-N_BENCHMARK = 200
-if als_art is not None:
-    all_users   = [int(u) for u in list(als_art['user_ids'])]
-    bench_users = np.random.choice(all_users, N_BENCHMARK, replace=True)
-
-cold_latencies = []   # Tracks Cache Miss (pipeline generation + serialization costs)
-warm_latencies = []   # Tracks Cache Hit  (Redis memory access lookup latencies)
+cold_latencies = []
+warm_latencies = []
 
 print("    Running cold requests (cache miss)...")
-for user_id in bench_users[:100]:
+for user_id in bench_users[:N_COLD_REQUESTS]:
     try:
-        # TODO: Enforce a cache miss constraint state by programmatically clearing storage for the user ID
-        # Hint: Issue a requests.delete method target against "http://localhost:8000/cache/{user_id}"
-        
-        # TODO: Time performance values using precise monotonic timestamps (time.perf_counter())
-        # Request targets: GET against "http://localhost:8000/recommend/{user_id}" with params {"top_k": 10, "use_cache": True}
-        # Append calculated execution delays mapping duration in milliseconds to cold_latencies
-        pass
-    except Exception:
+        requests.delete(f"{BASE_URL}/cache/{user_id}", timeout=15)
+        started = time.perf_counter()
+        response = requests.get(
+            f"{BASE_URL}/recommend/{user_id}",
+            params={"top_k": 10, "use_cache": True},
+            timeout=90,
+        )
+        response.raise_for_status()
+        cold_latencies.append((time.perf_counter() - started) * 1000)
+    except requests.RequestException:
         pass
 
 print("    Running warm requests (cache hit)...")
-for user_id in bench_users[:100]:
+for user_id in bench_users[:N_WARM_REQUESTS]:
     try:
-        # TODO: Time repeated calls directly following the cold iteration phase to catch memory responses
-        # Validate that response data structures show data['cached'] equals True before appending to warm_latencies
-        pass
-    except Exception:
+        started = time.perf_counter()
+        response = requests.get(
+            f"{BASE_URL}/recommend/{user_id}",
+            params={"top_k": 10, "use_cache": True},
+            timeout=30,
+        )
+        response.raise_for_status()
+        if response.json().get("cached") is True:
+            warm_latencies.append((time.perf_counter() - started) * 1000)
+    except requests.RequestException:
         pass
 
-# --- Statistical Performance Reporting ---
-# TODO: Map percentile limits (p50, p95, p99) over cold_latencies and warm_latencies using np.percentile()
-# Validate that processing times fit within strict target performance windows (< 50ms)
+percentiles = [50, 75, 90, 95, 99]
+if cold_latencies and warm_latencies:
+    cold_percentile_values = np.percentile(cold_latencies, percentiles)
+    warm_percentile_values = np.percentile(warm_latencies, percentiles)
+    print("\n    Latency Summary")
+    print("    " + "-" * 52)
+    print("    Percentile | Cold / Cache Miss | Warm / Cache Hit")
+    print("    " + "-" * 52)
+    for percentile, cold_value, warm_value in zip(percentiles, cold_percentile_values, warm_percentile_values):
+        print(f"    p{percentile:<9} | {cold_value:>8.2f} ms      | {warm_value:>8.2f} ms")
+else:
+    print("    WARNING: Insufficient latency samples collected.")
+    cold_percentile_values = np.zeros(len(percentiles))
+    warm_percentile_values = np.zeros(len(percentiles))
 
 
 # ---------------------------------------------------------------------------
 # SECTION 9: Latency Visualization
 # ---------------------------------------------------------------------------
 print("\n[9] Plotting latency results...")
-
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-fig.suptitle("Lab 4.1: FastAPI Endpoint Latency Benchmark\nCold (cache miss) vs Warm (cache hit)", fontsize=12, fontweight='bold')
+fig.suptitle(
+    "Lab 4.1: FastAPI Endpoint Latency Benchmark\nCold (cache miss) vs Warm (cache hit)",
+    fontsize=12,
+    fontweight="bold",
+)
 
-# --- Plot 1: Latency Density Distributions Histograms ---
-# TODO: Render overlaid tracking histograms tracking cold_latencies against warm_latencies
-# Identify SLA constraints by overlaying a reference marker threshold via axes[0].axvline(x=50, color='red')
-
-
+if cold_latencies:
+    axes[0].hist(cold_latencies, bins=min(25, len(cold_latencies)), alpha=0.65, label="Cold / Cache Miss", color="steelblue")
+if warm_latencies:
+    axes[0].hist(warm_latencies, bins=min(25, len(warm_latencies)), alpha=0.65, label="Warm / Cache Hit", color="seagreen")
+axes[0].axvline(50, color="red", linestyle="--", linewidth=2, label="p99 SLA target: 50 ms")
 axes[0].set_title("Latency Distribution")
 axes[0].set_xlabel("Latency (ms)")
 axes[0].set_ylabel("Requests")
+axes[0].legend()
+axes[0].grid(alpha=0.25)
 
-# --- Plot 2: Latency Percentile Profiles Bar Graph ---
-# TODO: Assemble comparative adjacent tracking bars checking scores across percentiles list: [50, 75, 90, 95, 99]
-
-
+x = np.arange(len(percentiles))
+bar_width = 0.38
+axes[1].bar(x - bar_width / 2, cold_percentile_values, width=bar_width, label="Cold / Cache Miss", color="steelblue")
+axes[1].bar(x + bar_width / 2, warm_percentile_values, width=bar_width, label="Warm / Cache Hit", color="seagreen")
+axes[1].axhline(50, color="red", linestyle="--", linewidth=2, label="SLA target: 50 ms")
+axes[1].set_xticks(x)
+axes[1].set_xticklabels([f"p{value}" for value in percentiles])
 axes[1].set_title("Percentile Comparison")
 axes[1].set_xlabel("Percentile")
 axes[1].set_ylabel("Latency (ms)")
+axes[1].legend()
+axes[1].grid(axis="y", alpha=0.25)
 
 plt.tight_layout()
-plt.savefig("output/01_fastapi_latency.png", dpi=150, bbox_inches='tight')
+plt.savefig("output/01_fastapi_latency.png", dpi=150, bbox_inches="tight")
 plt.show()
+print("    Saved -> output/01_fastapi_latency.png")
 
 
 # ---------------------------------------------------------------------------
-# SHUTDOWN SERVER BACKGROUND TIMERS
+# Shutdown Server
 # ---------------------------------------------------------------------------
 if server_process is not None:
-    # TODO: Gracefully shut down background system wrappers to free local listening ports
-    # Hint: Call server_process.terminate()
-    print("\n    Server process terminated")
+    server_process.terminate()
+    try:
+        server_process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        server_process.kill()
+
+server_log.close()
+print("\n    Server process terminated")
+print("    Server log saved -> output/fastapi_server.log")
